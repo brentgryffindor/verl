@@ -1234,3 +1234,21 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+    
+    def auto_fit(self):
+
+        # call fit but catch OOM errors
+        try:
+            self.fit()
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("OOM error caught during training. Attempting to recover...")
+                # Free up memory
+                torch.cuda.empty_cache()
+                # TODO: Do recovery here
+
+                # Retry training
+                self.auto_fit()
+            else:
+                # If it's not an OOM error, re-raise the exception
+                raise e
