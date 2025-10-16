@@ -42,6 +42,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.oom_handlers import build_actor_update_oom_handler
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -774,8 +775,8 @@ class RayPPOTrainer:
         self.actor_update_oom_guard = wrap_method_with_oom_guard(
             self.actor_rollout_wg,
             "update_actor",
-            enable_splitting=False,
         )
+        self.actor_update_oom_guard._on_aborted = build_actor_update_oom_handler(self, self.actor_update_oom_guard)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False

@@ -2,10 +2,10 @@
 
 This module provides a reusable wrapper that can be installed on any worker group
 method (e.g. ``generate_sequences``) to catch out-of-memory errors raised by the
-underlying workers. When an OOM happens, the wrapper retries the invocation,
-optionally splits the incoming batch into smaller chunks, and concatenates the
-successful results. If the OOM persists for a single sample, it produces an
-aborted placeholder so the caller can continue without crashing.
+underlying workers. When an OOM happens, the wrapper retries the invocation and,
+if it still fails, delegates recovery to a user-provided handler that can apply
+custom mitigation or return a placeholder batch so the caller can continue
+without crashing.
 
 The wrapper is intentionally decoupled from any specific trainer so it can be
 reused across different worker groups.
@@ -18,11 +18,11 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
-from pprint import pprint
 
 import numpy as np
 import torch
 from ray.exceptions import RayActorError, RayTaskError
+from pprint import pprint
 
 from verl import DataProto
 
@@ -102,17 +102,15 @@ class OOMRecoveryStats:
     """Track wrapper level statistics for observability."""
 
     total_retries: int = 0
-    total_splits: int = 0
-    recovered_batches: int = 0
     aborted_samples: int = 0
 
 
 class WorkgroupOOMGuard:
     """Wrap a worker group method to recover from GPU OOM errors.
 
-    The guard retries the method on OOM, attempts to split the incoming batch into
-    smaller pieces, and concatenates the successful outputs. It exposes statistics
-    on how often recovery happens to help with monitoring.
+    The guard retries the method on OOM and, if it still fails, invokes a recovery
+    handler so callers can decide how to proceed. It exposes lightweight statistics
+    to aid monitoring.
     """
 
     def __init__(
@@ -121,8 +119,6 @@ class WorkgroupOOMGuard:
         method_name: str = "generate_sequences",
         *,
         max_retries: int = 5,
-        min_chunk_size: int = 1,
-        enable_splitting: bool = True,
         on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
         log: Optional[logging.Logger] = None,
     ) -> None:
@@ -130,8 +126,6 @@ class WorkgroupOOMGuard:
         self.method_name = method_name
         self._original_method = getattr(workgroup, method_name)
         self.max_retries = max(0, max_retries)
-        self.min_chunk_size = max(1, min_chunk_size)
-        self.enable_splitting = enable_splitting
         self._on_aborted = on_aborted or self._build_aborted_dataprotos
         self.stats = OOMRecoveryStats()
 
@@ -165,7 +159,6 @@ class WorkgroupOOMGuard:
         setattr(self.workgroup, self.method_name, wrapped)
 
     def _invoke_with_recovery(self, fn, batch: DataProto, *args, **kwargs) -> DataProto:
-        pprint(f"[OOMGuard] Invoking {type(self.workgroup).__name__}.{self.method_name} with batch size {len(batch)}")
         try:
             return self._call_with_retries(fn, batch, *args, **kwargs)
         except BaseException as exc:
@@ -173,42 +166,18 @@ class WorkgroupOOMGuard:
                 raise
 
             self._logger.warning(
-                "[OOMGuard] %s.%s encountered OOM after retries; attempting to split batch "
-                "(size=%d). Error: %s",
+                "[OOMGuard] %s.%s encountered OOM after retries (batch_size=%d). Error: %s",
                 type(self.workgroup).__name__,
                 self.method_name,
                 len(batch),
                 _format_exception(exc),
             )
-            if not self.enable_splitting:
-                aborted = self._on_aborted(batch, exc)
-                self.stats.aborted_samples += len(batch)
-                return aborted
+            result = self._call_abort_handler(batch, exc, attempt=self.max_retries, final=True)
+            if result is None:
+                result = self._build_aborted_dataprotos(batch, exc)
 
-            if len(batch) <= self.min_chunk_size:
-                aborted = self._on_aborted(batch, exc)
-                self.stats.aborted_samples += len(batch)
-                return aborted
-
-            split_size = self._compute_split_size(len(batch))
-            if split_size is None:
-                aborted = self._on_aborted(batch, exc)
-                self.stats.aborted_samples += len(batch)
-                return aborted
-
-            sub_batches = batch.split(split_size)
-            self.stats.total_splits += 1
-            outputs: list[DataProto] = []
-            for sub_batch in sub_batches:
-                outputs.append(self._invoke_with_recovery(fn, sub_batch, *args, **kwargs))
-
-            recovered = DataProto.concat(outputs)
-            recovered.meta_info = self._merge_meta_info(outputs, recovered.meta_info)
-            recovered.meta_info.setdefault("oom_guard", {})["num_splits"] = (
-                recovered.meta_info.get("oom_guard", {}).get("num_splits", 0) + 1
-            )
-            self.stats.recovered_batches += 1
-            return recovered
+            self.stats.aborted_samples += len(batch)
+            return result
 
     def _call_with_retries(self, fn, batch: DataProto, *args, **kwargs) -> DataProto:
         attempts = self.max_retries + 1
@@ -216,6 +185,7 @@ class WorkgroupOOMGuard:
         for attempt in range(attempts):
             try:
                 if attempt > 0:
+                    pprint(f"[OOMGuard] Retry {attempt}/{self.max_retries} for {type(self.workgroup).__name__}.{self.method_name})")
                     self._logger.info(
                         "[OOMGuard] Retry %d/%d for %s.%s (batch_size=%d)",
                         attempt,
@@ -228,47 +198,39 @@ class WorkgroupOOMGuard:
                 return fn(batch, *args, **kwargs)
             except BaseException as exc:
                 last_exc = exc
-                pprint(f"[OOMGuard] Caught exception on attempt {attempt}: {exc}")
                 if not _is_oom_error(exc):
-                    pprint(f"[OOMGuard] Not an OOM error, re-raising.")
                     raise
+                result = self._call_abort_handler(batch, exc, attempt=attempt, final=False)
+                if result is not None:
+                    self.stats.aborted_samples += len(batch)
+                    return result
         assert last_exc is not None
         raise last_exc
 
-    def _compute_split_size(self, length: int) -> Optional[int]:
-        """Choose a split size that reduces batch size while staying above the minimum."""
-        if length <= 1:
-            return None
-        split_size = max(self.min_chunk_size, length // 2)
-        if split_size >= length:
-            split_size = length - 1
-        return split_size if split_size >= 1 else None
-
-    def _merge_meta_info(self, outputs: list[DataProto], base_meta: dict[str, Any]) -> dict[str, Any]:
-        """Merge meta info dictionaries, preserving timing data when possible."""
-        meta = deepcopy(base_meta) if base_meta is not None else {}
-        total_timing: dict[str, float] = {}
-        for out in outputs:
-            if "timing" not in out.meta_info:
-                continue
-            for key, value in out.meta_info["timing"].items():
-                if isinstance(value, (int, float)):
-                    total_timing[key] = total_timing.get(key, 0.0) + float(value)
-        if total_timing:
-            meta.setdefault("timing", {})
-            for key, value in total_timing.items():
-                meta["timing"][f"{key}_sum"] = meta["timing"].get(f"{key}_sum", 0.0) + value
-        meta.setdefault("oom_guard", {})
-        meta["oom_guard"]["enabled"] = True
-        meta["oom_guard"]["total_retries"] = self.stats.total_retries
-        meta["oom_guard"]["total_splits"] = self.stats.total_splits
-        meta["oom_guard"]["aborted_samples"] = self.stats.aborted_samples
-        return meta
+    def _call_abort_handler(
+        self,
+        batch: DataProto,
+        exc: BaseException,
+        *,
+        attempt: Optional[int],
+        final: bool,
+    ) -> Optional[DataProto]:
+        """Invoke the abort handler with best-effort compatibility."""
+        kwargs = {
+            "attempt": attempt,
+            "max_retries": self.max_retries,
+            "guard": self,
+            "final": final,
+        }
+        try:
+            return self._on_aborted(batch, exc, **kwargs)
+        except TypeError:
+            return self._on_aborted(batch, exc)
 
     # ------------------------------------------------------------------ #
     # Default aborted result helper
     # ------------------------------------------------------------------ #
-    def _build_aborted_dataprotos(self, batch: DataProto, exc: BaseException) -> DataProto:
+    def _build_aborted_dataprotos(self, batch: DataProto, exc: BaseException, **_) -> DataProto:
         """Create a placeholder DataProto for samples that cannot be recovered."""
         batch_size = len(batch)
         tensors: dict[str, torch.Tensor] = {}
@@ -328,9 +290,7 @@ def wrap_method_with_oom_guard(
     workgroup: Any,
     method_name: str,
     *,
-    max_retries: int = 1,
-    min_chunk_size: int = 1,
-    enable_splitting: bool = True,
+    max_retries: int = 5,
     on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
     log: Optional[logging.Logger] = None,
 ) -> WorkgroupOOMGuard:
@@ -347,8 +307,6 @@ def wrap_method_with_oom_guard(
         workgroup,
         method_name=method_name,
         max_retries=max_retries,
-        min_chunk_size=min_chunk_size,
-        enable_splitting=enable_splitting,
         on_aborted=on_aborted,
         log=log,
     )
@@ -359,8 +317,7 @@ def wrap_method_with_oom_guard(
 def wrap_generate_sequences_with_oom_guard(
     workgroup: Any,
     *,
-    max_retries: int = 1,
-    min_chunk_size: int = 1,
+    max_retries: int = 5,
     on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
     log: Optional[logging.Logger] = None,
 ) -> WorkgroupOOMGuard:
@@ -369,8 +326,6 @@ def wrap_generate_sequences_with_oom_guard(
         workgroup,
         "generate_sequences",
         max_retries=max_retries,
-        min_chunk_size=min_chunk_size,
-        enable_splitting=True,
         on_aborted=on_aborted,
         log=log,
     )

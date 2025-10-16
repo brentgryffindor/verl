@@ -33,7 +33,7 @@ class UpdateActorWorkgroup:
 
 def test_wrap_update_actor_without_splitting():
     workgroup = UpdateActorWorkgroup()
-    wrap_method_with_oom_guard(workgroup, "update_actor", max_retries=0, enable_splitting=False)
+    wrap_method_with_oom_guard(workgroup, "update_actor", max_retries=0)
 
     batch = DataProto.from_dict({"input_ids": torch.zeros((2, 1), dtype=torch.long)}, meta_info={})
     result = workgroup.update_actor(batch)
