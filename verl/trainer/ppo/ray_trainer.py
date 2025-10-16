@@ -56,6 +56,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.workgroup_oom_guard import wrap_generate_sequences_with_oom_guard
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -753,6 +754,8 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+        # Install OOM guard so rollout generation failures can be recovered without aborting training.
+        self.actor_rollout_oom_guard = wrap_generate_sequences_with_oom_guard(self.actor_rollout_wg)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
