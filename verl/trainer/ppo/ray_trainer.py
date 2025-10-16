@@ -56,7 +56,7 @@ from verl.utils.config import list_config_paths, omega_conf_to_dataclass, update
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.workgroup_oom_guard import wrap_generate_sequences_with_oom_guard
+from verl.utils.workgroup_oom_guard import wrap_generate_sequences_with_oom_guard, wrap_method_with_oom_guard
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -770,6 +770,12 @@ class RayPPOTrainer:
         self.actor_rollout_wg.init_model()
         # Install OOM guard so rollout generation failures can be recovered without aborting training.
         self.actor_rollout_oom_guard = wrap_generate_sequences_with_oom_guard(self.actor_rollout_wg)
+        # Also guard actor updates to catch memory spikes during backward passes.
+        self.actor_update_oom_guard = wrap_method_with_oom_guard(
+            self.actor_rollout_wg,
+            "update_actor",
+            enable_splitting=False,
+        )
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -987,6 +993,9 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+
+        # pprint("========================Configurable parameters:===========================================")
+        # pprint(self.list_configurable_params())
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:

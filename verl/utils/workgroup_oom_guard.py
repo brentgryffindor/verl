@@ -18,6 +18,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
+from pprint import pprint
 
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ from ray.exceptions import RayActorError, RayTaskError
 
 from verl import DataProto
 
-__all__ = ["WorkgroupOOMGuard", "wrap_generate_sequences_with_oom_guard"]
+__all__ = ["WorkgroupOOMGuard", "wrap_generate_sequences_with_oom_guard", "wrap_method_with_oom_guard"]
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +120,9 @@ class WorkgroupOOMGuard:
         workgroup: Any,
         method_name: str = "generate_sequences",
         *,
-        max_retries: int = 1,
+        max_retries: int = 5,
         min_chunk_size: int = 1,
+        enable_splitting: bool = True,
         on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
         log: Optional[logging.Logger] = None,
     ) -> None:
@@ -129,6 +131,7 @@ class WorkgroupOOMGuard:
         self._original_method = getattr(workgroup, method_name)
         self.max_retries = max(0, max_retries)
         self.min_chunk_size = max(1, min_chunk_size)
+        self.enable_splitting = enable_splitting
         self._on_aborted = on_aborted or self._build_aborted_dataprotos
         self.stats = OOMRecoveryStats()
 
@@ -153,11 +156,16 @@ class WorkgroupOOMGuard:
         def wrapped(batch: DataProto, *args, **kwargs):
             return guard._invoke_with_recovery(original, batch, *args, **kwargs)
 
-        wrapped.__name__ = original.__name__
-        wrapped.__doc__ = original.__doc__
+        if hasattr(original, "__name__"):
+            wrapped.__name__ = original.__name__
+        else:
+            wrapped.__name__ = f"{self.method_name}_wrapped"
+        wrapped.__doc__ = getattr(original, "__doc__", wrapped.__doc__)
+        wrapped.__wrapped__ = original  # type: ignore[attr-defined]
         setattr(self.workgroup, self.method_name, wrapped)
 
     def _invoke_with_recovery(self, fn, batch: DataProto, *args, **kwargs) -> DataProto:
+        pprint(f"[OOMGuard] Invoking {type(self.workgroup).__name__}.{self.method_name} with batch size {len(batch)}")
         try:
             return self._call_with_retries(fn, batch, *args, **kwargs)
         except BaseException as exc:
@@ -172,7 +180,10 @@ class WorkgroupOOMGuard:
                 len(batch),
                 _format_exception(exc),
             )
-            self.stats.total_splits += 1
+            if not self.enable_splitting:
+                aborted = self._on_aborted(batch, exc)
+                self.stats.aborted_samples += len(batch)
+                return aborted
 
             if len(batch) <= self.min_chunk_size:
                 aborted = self._on_aborted(batch, exc)
@@ -186,6 +197,7 @@ class WorkgroupOOMGuard:
                 return aborted
 
             sub_batches = batch.split(split_size)
+            self.stats.total_splits += 1
             outputs: list[DataProto] = []
             for sub_batch in sub_batches:
                 outputs.append(self._invoke_with_recovery(fn, sub_batch, *args, **kwargs))
@@ -216,7 +228,9 @@ class WorkgroupOOMGuard:
                 return fn(batch, *args, **kwargs)
             except BaseException as exc:
                 last_exc = exc
+                pprint(f"[OOMGuard] Caught exception on attempt {attempt}: {exc}")
                 if not _is_oom_error(exc):
+                    pprint(f"[OOMGuard] Not an OOM error, re-raising.")
                     raise
         assert last_exc is not None
         raise last_exc
@@ -306,8 +320,40 @@ class WorkgroupOOMGuard:
         non_tensor_batch["oom_guard/aborted"] = np.ones(batch_size, dtype=bool)
 
         placeholder = DataProto.from_dict(tensors=tensors, non_tensors=non_tensor_batch, meta_info=meta_info)
-        placeholder.meta_info.setdefault("timing", {})["generate_sequences"] = 0.0
+        placeholder.meta_info.setdefault("timing", {})[self.method_name] = 0.0
         return placeholder
+
+
+def wrap_method_with_oom_guard(
+    workgroup: Any,
+    method_name: str,
+    *,
+    max_retries: int = 1,
+    min_chunk_size: int = 1,
+    enable_splitting: bool = True,
+    on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
+    log: Optional[logging.Logger] = None,
+) -> WorkgroupOOMGuard:
+    """Install an OOM guard on an arbitrary workgroup method."""
+    if not hasattr(workgroup, method_name):
+        raise AttributeError(f"{type(workgroup).__name__} has no attribute '{method_name}'")
+
+    attr_name = f"_oom_guard_installed_{method_name}"
+    existing = getattr(workgroup, attr_name, None)
+    if isinstance(existing, WorkgroupOOMGuard):
+        return existing
+
+    guard = WorkgroupOOMGuard(
+        workgroup,
+        method_name=method_name,
+        max_retries=max_retries,
+        min_chunk_size=min_chunk_size,
+        enable_splitting=enable_splitting,
+        on_aborted=on_aborted,
+        log=log,
+    )
+    setattr(workgroup, attr_name, guard)
+    return guard
 
 
 def wrap_generate_sequences_with_oom_guard(
@@ -319,17 +365,12 @@ def wrap_generate_sequences_with_oom_guard(
     log: Optional[logging.Logger] = None,
 ) -> WorkgroupOOMGuard:
     """Convenience helper to install an OOM guard on ``generate_sequences``."""
-    attr_name = "_oom_guard_installed"
-    if getattr(workgroup, attr_name, None):
-        return getattr(workgroup, attr_name)
-
-    guard = WorkgroupOOMGuard(
+    return wrap_method_with_oom_guard(
         workgroup,
-        method_name="generate_sequences",
+        "generate_sequences",
         max_retries=max_retries,
         min_chunk_size=min_chunk_size,
+        enable_splitting=True,
         on_aborted=on_aborted,
         log=log,
     )
-    setattr(workgroup, attr_name, guard)
-    return guard
