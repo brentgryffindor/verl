@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import is_dataclass
+from dataclasses import fields, is_dataclass
 from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-__all__ = ["omega_conf_to_dataclass", "validate_config"]
+__all__ = ["omega_conf_to_dataclass", "validate_config", "update_config_value", "list_config_paths"]
 
 
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
@@ -69,6 +69,171 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
     for key in dictionary:
         if hasattr(config, key):
             dictionary[key] = getattr(config, key)
+
+
+def list_config_paths(config: Any, prefix: str = "") -> list[str]:
+    """Return a list of dotted paths for all configurable leaves in ``config``."""
+
+    if not _is_container(config):
+        return [prefix] if prefix else []
+
+    paths: list[str] = []
+    for key, value in _iter_config_items(config):
+        if key is None:
+            continue
+        key_str = str(key)
+        path = f"{prefix}.{key_str}" if prefix else key_str
+
+        if _is_container(value):
+            child_paths = list_config_paths(value, path)
+            if child_paths:
+                paths.extend(child_paths)
+            else:
+                paths.append(path)
+        else:
+            paths.append(path)
+
+    return paths
+
+
+def update_config_value(config: Any, parameter_path: str, value: Any) -> None:
+    """Update a configuration value using a dotted parameter path.
+
+    Supports both OmegaConf ``DictConfig`` objects and dataclass based configs
+    (including subclasses of ``BaseConfig``). The function walks the dotted
+    path (e.g. ``"actor_rollout_ref.actor.ppo_mini_batch_size"``) and updates
+    the referenced leaf value in-place.
+
+    Args:
+        config: The configuration object to modify.
+        parameter_path: Dotted path locating the parameter to update.
+        value: The value to assign to the parameter.
+
+    Raises:
+        KeyError: If the parameter path does not exist.
+        TypeError: If an intermediate object in the path is not indexable.
+        omegaconf.errors.ReadonlyConfigError: If OmegaConf struct mode forbids the update.
+        dataclasses.FrozenInstanceError: If the dataclass field is immutable.
+    """
+
+    if isinstance(config, DictConfig | ListConfig):
+        _update_dictconfig_value(config, parameter_path, value)
+        return
+
+    if is_dataclass(config):
+        _update_dataclass_value(config, parameter_path, value)
+        return
+
+    raise TypeError(f"Unsupported config type: {type(config)}")
+
+
+def _update_dictconfig_value(config: DictConfig | ListConfig, parameter_path: str, value: Any) -> None:
+    """Internal helper to update DictConfig/ListConfig values."""
+    struct_flag = OmegaConf.is_struct(config)
+    try:
+        if struct_flag:
+            OmegaConf.set_struct(config, False)
+
+        # Validate that the path exists before attempting to update.
+        OmegaConf.select(config, parameter_path, throw_on_missing=True)
+        OmegaConf.update(config, parameter_path, value, merge=False)
+    finally:
+        if struct_flag:
+            OmegaConf.set_struct(config, True)
+
+
+def _update_dataclass_value(config: Any, parameter_path: str, value: Any) -> None:
+    """Internal helper to update dataclass-based configs."""
+    parent, attr = _resolve_attr_path(config, parameter_path)
+
+    if isinstance(parent, dict):
+        if attr not in parent:
+            raise KeyError(f"Key '{attr}' not found while updating '{parameter_path}'")
+        parent[attr] = value
+        return
+
+    if hasattr(parent, attr):
+        setattr(parent, attr, value)
+        return
+
+    raise KeyError(f"Attribute '{attr}' not found while updating '{parameter_path}'")
+
+
+def _resolve_attr_path(config: Any, parameter_path: str) -> tuple[Any, str]:
+    """Resolve the parent object and leaf attribute for a dotted parameter path."""
+    if not parameter_path:
+        raise ValueError("parameter_path must be a non-empty string")
+
+    segments = parameter_path.split(".")
+    parent = config
+
+    for segment in segments[:-1]:
+        parent = _navigate_to_child(parent, segment, parameter_path)
+
+    return parent, segments[-1]
+
+
+def _navigate_to_child(current: Any, segment: str, full_path: str) -> Any:
+    """Navigate to the next node specified by 'segment' from 'current'."""
+    if isinstance(current, DictConfig):
+        try:
+            return current[segment]
+        except Exception as exc:  # pragma: no cover - OmegaConf raises specialised errors
+            raise KeyError(f"Failed to access '{segment}' while updating '{full_path}'") from exc
+
+    if isinstance(current, ListConfig):
+        try:
+            idx = int(segment)
+        except ValueError as exc:
+            raise TypeError(f"List segment '{segment}' must be an integer while updating '{full_path}'") from exc
+        try:
+            return current[idx]
+        except Exception as exc:  # pragma: no cover
+            raise KeyError(f"Index '{segment}' out of range while updating '{full_path}'") from exc
+
+    if isinstance(current, dict):
+        if segment not in current:
+            raise KeyError(f"Key '{segment}' not found while updating '{full_path}'")
+        return current[segment]
+
+    if isinstance(current, list):
+        try:
+            idx = int(segment)
+        except ValueError as exc:
+            raise TypeError(f"List segment '{segment}' must be an integer while updating '{full_path}'") from exc
+        try:
+            return current[idx]
+        except Exception as exc:  # pragma: no cover
+            raise KeyError(f"Index '{segment}' out of range while updating '{full_path}'") from exc
+
+    if hasattr(current, segment):
+        return getattr(current, segment)
+
+    raise KeyError(f"Attribute '{segment}' not found while updating '{full_path}'")
+
+
+def _is_container(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (DictConfig, dict, ListConfig, list)):
+        return not isinstance(value, (str, bytes))
+    if is_dataclass(value):
+        return True
+    return False
+
+
+def _iter_config_items(config: Any):
+    if isinstance(config, DictConfig):
+        return config.items()
+    if isinstance(config, dict):
+        return config.items()
+    if isinstance(config, ListConfig):
+        return enumerate(config)
+    if isinstance(config, list):
+        return enumerate(config)
+    if is_dataclass(config):
+        return ((field.name, getattr(config, field.name)) for field in fields(config) if not field.name.startswith("_"))
+    return ()
 
 
 def validate_config(

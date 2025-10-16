@@ -52,7 +52,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
-from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.config import list_config_paths, omega_conf_to_dataclass, update_config_value
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
@@ -340,6 +340,20 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def update_config(self, parameter_path: str, value):
+        """Update a configuration value using a dotted parameter path.
+
+        Args:
+            parameter_path: Dotted path to the parameter (e.g. ``actor_rollout_ref.actor.ppo_mini_batch_size``).
+            value: The value to assign.
+        """
+        update_config_value(self.config, parameter_path, value)
+
+    def list_configurable_params(self) -> list[str]:
+        """Return the dotted paths for all configurable parameters."""
+        paths = list_config_paths(self.config)
+        return sorted(dict.fromkeys(paths))
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
