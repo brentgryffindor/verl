@@ -159,6 +159,7 @@ class WorkgroupOOMGuard:
         setattr(self.workgroup, self.method_name, wrapped)
 
     def _invoke_with_recovery(self, fn, batch: DataProto, *args, **kwargs) -> DataProto:
+        pprint(f"[OOMGuard] Invoking {type(self.workgroup).__name__}.{self.method_name}")
         try:
             return self._call_with_retries(fn, batch, *args, **kwargs)
         except BaseException as exc:
@@ -205,6 +206,7 @@ class WorkgroupOOMGuard:
                     self.stats.aborted_samples += len(batch)
                     return result
         assert last_exc is not None
+        pprint(f"[OOMGuard] All retries exhausted for {type(self.workgroup).__name__}.{self.method_name}. Raising last exception.")
         raise last_exc
 
     def _call_abort_handler(
@@ -290,7 +292,7 @@ def wrap_method_with_oom_guard(
     workgroup: Any,
     method_name: str,
     *,
-    max_retries: int = 5,
+    max_retries: int = 10,
     on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
     log: Optional[logging.Logger] = None,
 ) -> WorkgroupOOMGuard:
@@ -317,7 +319,7 @@ def wrap_method_with_oom_guard(
 def wrap_generate_sequences_with_oom_guard(
     workgroup: Any,
     *,
-    max_retries: int = 5,
+    max_retries: int = 10,
     on_aborted: Optional[Callable[[DataProto, BaseException], DataProto]] = None,
     log: Optional[logging.Logger] = None,
 ) -> WorkgroupOOMGuard:

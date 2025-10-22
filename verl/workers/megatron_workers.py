@@ -40,7 +40,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
-from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.config import omega_conf_to_dataclass, update_config_value
 from verl.utils.device import (
     get_device_id,
     get_device_name,
@@ -284,6 +284,39 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+
+    def _maybe_update_component_config(self, component: Any, parameter_path: str, value: Any) -> None:
+        """Best-effort sync for dataclass-backed sub-configs."""
+        if component is None:
+            return
+        try:
+            update_config_value(component, parameter_path, value)
+        except Exception:
+            logger.debug(
+                "Skipping nested config update for path '%s' on worker rank %s",
+                parameter_path,
+                getattr(self, "rank", "unknown"),
+            )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_runtime_config(self, parameter_path: str, value: Any) -> None:
+        """Update runtime configuration values on the worker."""
+        update_config_value(self.config, parameter_path, value)
+
+        if self._is_actor and hasattr(self, "actor"):
+            prefix = "actor."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.actor.config, parameter_path[len(prefix) :], value)
+
+        if self._is_rollout and hasattr(self, "rollout") and hasattr(self.rollout, "config"):
+            prefix = "rollout."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.rollout.config, parameter_path[len(prefix) :], value)
+
+        if self._is_ref and hasattr(self, "ref_policy"):
+            prefix = "ref."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.ref_policy.config, parameter_path[len(prefix) :], value)
 
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None

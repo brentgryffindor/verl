@@ -51,7 +51,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.config import omega_conf_to_dataclass, update_config_value
 from verl.utils.device import (
     get_device_id,
     get_device_name,
@@ -774,13 +774,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if fsdp_version(self.actor_module_fsdp) == 1:
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-                log_gpu_memory_usage("After offload actor model during init", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-                log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
@@ -839,6 +839,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
             )
+
+    def _maybe_update_component_config(self, component: Any, parameter_path: str, value: Any) -> None:
+        """Best-effort sync for dataclass-backed sub-configs."""
+        if component is None:
+            return
+        try:
+            update_config_value(component, parameter_path, value)
+        except Exception:
+            logger.debug(
+                "Skipping nested config update for path '%s' on worker rank %s",
+                parameter_path,
+                getattr(self, "rank", "unknown"),
+            )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_runtime_config(self, parameter_path: str, value: Any) -> None:
+        """Update runtime configuration values on the worker."""
+        update_config_value(self.config, parameter_path, value)
+
+        if self._is_actor and hasattr(self, "actor"):
+            prefix = "actor."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.actor.config, parameter_path[len(prefix) :], value)
+
+        if self._is_rollout and hasattr(self, "rollout") and hasattr(self.rollout, "config"):
+            prefix = "rollout."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.rollout.config, parameter_path[len(prefix) :], value)
+
+        if self._is_ref and hasattr(self, "ref_policy"):
+            prefix = "ref."
+            if parameter_path.startswith(prefix):
+                self._maybe_update_component_config(self.ref_policy.config, parameter_path[len(prefix) :], value)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")

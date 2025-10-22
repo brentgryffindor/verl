@@ -25,7 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -42,7 +42,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.oom_handlers import build_actor_update_oom_handler
+from verl.trainer.ppo.oom_handlers import build_llm_actor_update_oom_handler
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -350,6 +350,17 @@ class RayPPOTrainer:
             value: The value to assign.
         """
         update_config_value(self.config, parameter_path, value)
+        self._broadcast_config_update(parameter_path, value)
+
+    def _broadcast_config_update(self, parameter_path: str, value: Any) -> None:
+        """Propagate config updates to remote worker groups when applicable."""
+        actor_prefix = "actor_rollout_ref."
+        if parameter_path.startswith(actor_prefix):
+            relative_path = parameter_path[len(actor_prefix) :]
+            if getattr(self, "actor_rollout_wg", None) is not None:
+                self.actor_rollout_wg.update_runtime_config(relative_path, value)
+            if getattr(self, "ref_policy_wg", None) is not None:
+                self.ref_policy_wg.update_runtime_config(relative_path, value)
 
     def list_configurable_params(self) -> list[str]:
         """Return the dotted paths for all configurable parameters."""
@@ -776,7 +787,10 @@ class RayPPOTrainer:
             self.actor_rollout_wg,
             "update_actor",
         )
-        self.actor_update_oom_guard._on_aborted = build_actor_update_oom_handler(self, self.actor_update_oom_guard)
+        self.actor_update_oom_guard._on_aborted = build_llm_actor_update_oom_handler(
+            self,
+            self.actor_update_oom_guard,
+        )
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
