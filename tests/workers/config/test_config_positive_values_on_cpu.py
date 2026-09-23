@@ -14,8 +14,10 @@
 
 import unittest
 
+from omegaconf import MISSING
+
 from verl.utils.config import omega_conf_to_dataclass
-from verl.workers.config import RolloutConfig
+from verl.workers.config import ActorConfig, CriticConfig, OptimizerConfig, RolloutConfig
 
 
 def _actor_dict(**overrides):
@@ -60,12 +62,31 @@ class TestRolloutConfigPositiveValues(unittest.TestCase):
 class TestBatchSizePositiveValues(unittest.TestCase):
     """ppo_micro_batch_size_per_gpu=0 used to reach the engine's divisibility check as a modulo by zero."""
 
-    def test_zero_micro_batch_rejected(self):
+    BAD_VALUES = (0, -1, False, True, 0.5, 1.0, "4")
+
+    def test_non_positive_integer_micro_batch_rejected(self):
         # hydra wraps errors raised in __post_init__ in InstantiationException; match on the message.
         for build in (_actor_dict, _critic_dict):
-            with self.subTest(config=build.__name__), self.assertRaises(Exception) as ctx:
-                omega_conf_to_dataclass(build(ppo_micro_batch_size_per_gpu=0))
-            self.assertIn("must be a positive integer", str(ctx.exception))
+            for bad in self.BAD_VALUES:
+                with self.subTest(config=build.__name__, value=bad), self.assertRaises(Exception) as ctx:
+                    omega_conf_to_dataclass(build(ppo_micro_batch_size_per_gpu=bad))
+                self.assertIn("must be a positive integer", str(ctx.exception))
+
+    def test_direct_construction_rejects_bool_and_float(self):
+        # Direct dataclass construction bypasses hydra, so the check must not rely on config typing.
+        for bad in self.BAD_VALUES:
+            with self.subTest(config="actor", value=bad), self.assertRaises(ValueError):
+                ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=bad)
+            with self.subTest(config="critic", value=bad), self.assertRaises(ValueError):
+                CriticConfig(strategy="fsdp", ppo_micro_batch_size_per_gpu=bad, optim=OptimizerConfig(lr=0.1))
+        for bad in self.BAD_VALUES:
+            with self.subTest(config="actor", key="ppo_mini_batch_size", value=bad), self.assertRaises(ValueError):
+                ActorConfig(strategy="fsdp", rollout_n=1, ppo_mini_batch_size=bad, ppo_micro_batch_size_per_gpu=1)
+
+    def test_missing_mini_batch_size_is_left_to_validate(self):
+        # ppo_mini_batch_size may be omegaconf MISSING on direct construction; it is checked later in validate().
+        cfg = ActorConfig(strategy="fsdp", rollout_n=1, ppo_mini_batch_size=MISSING, ppo_micro_batch_size_per_gpu=1)
+        self.assertEqual(cfg.ppo_mini_batch_size, MISSING)
 
     def test_valid_batch_sizes_pass(self):
         self.assertEqual(omega_conf_to_dataclass(_actor_dict()).ppo_micro_batch_size_per_gpu, 8)
